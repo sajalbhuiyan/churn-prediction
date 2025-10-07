@@ -47,6 +47,34 @@ try:
 except:
     catboost_installed = False
 
+def safe_roc_auc(y_true, y_score):
+    """Compute ROC AUC safely for binary and multiclass when possible.
+    Returns np.nan when ROC-AUC is not applicable or fails.
+    """
+    try:
+        y_true_arr = np.array(y_true)
+        y_score_arr = np.array(y_score)
+        mask = ~pd.isnull(y_true_arr)
+        y_true_arr = y_true_arr[mask]
+        y_score_arr = y_score_arr[mask]
+        uniq = np.unique(y_true_arr)
+        if len(uniq) <= 1:
+            return np.nan
+        if len(uniq) == 2:
+            if y_score_arr.ndim == 1:
+                return roc_auc_score(y_true_arr, y_score_arr)
+            elif y_score_arr.ndim == 2 and y_score_arr.shape[1] >= 2:
+                return roc_auc_score(y_true_arr, y_score_arr[:, 1])
+            else:
+                return np.nan
+        if len(uniq) > 2:
+            if y_score_arr.ndim == 2 and y_score_arr.shape[1] == len(uniq):
+                return roc_auc_score(y_true_arr, y_score_arr, multi_class='ovr', average='macro')
+            else:
+                return np.nan
+    except Exception:
+        return np.nan
+
 st.set_page_config(page_title="User Churn Prediction", layout="wide")
 st.title("🛡️ User Churn Prediction App (Advanced EDA + Models)")
 
