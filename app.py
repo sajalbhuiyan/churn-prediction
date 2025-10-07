@@ -55,6 +55,7 @@ if uploaded_file:
     # --- Data tab ---
     with tab_data:
         st.subheader("Dataset Preview")
+        st.write(f"Dataset size: {len(data):,} rows × {data.shape[1]} columns")
         st.dataframe(data.head())
         st.markdown("**Dataset Info**")
         buffer = io.StringIO()
@@ -142,6 +143,9 @@ if uploaded_file:
         target_column = st.selectbox('Select the target column (optional) for EDA', [None] + list(df.columns))
         if target_column:
             st.write(df[target_column].value_counts())
+            if plotly_installed:
+                fig_td = px.histogram(df, x=target_column, title=f'Distribution of {target_column}')
+                st.plotly_chart(fig_td, use_container_width=True)
             # Show target vs numeric boxplots
             num_for_target = [c for c in df.select_dtypes(include=[np.number]).columns if c != target_column]
             if num_for_target:
@@ -252,6 +256,11 @@ if uploaded_file:
 
             results_df = pd.DataFrame(results, columns=["Model", "Accuracy", "F1-score", "ROC-AUC"]).sort_values(by='ROC-AUC', ascending=False)
             st.subheader("Model Performance Comparison")
+            metric = st.selectbox('Metric for comparison', ['ROC-AUC','Accuracy','F1-score'], index=0)
+            if plotly_installed and not results_df.empty:
+                fig_cmp = px.bar(results_df, x=metric, y='Model', orientation='h', text=metric, title=f'Model comparison ({metric})')
+                fig_cmp.update_layout(height=min(400, 100 + len(results_df)*40))
+                st.plotly_chart(fig_cmp, use_container_width=True)
             st.dataframe(results_df)
 
             if not results_df.empty:
@@ -262,12 +271,18 @@ if uploaded_file:
                 # Confusion Matrix
                 st.subheader(f"Confusion Matrix ({best_model_name})")
                 y_pred_best = best_model.predict(X_test)
-                cm = confusion_matrix(y_test, y_pred_best)
-                fig, ax = plt.subplots()
-                sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax)
-                ax.set_xlabel("Predicted")
-                ax.set_ylabel("Actual")
-                st.pyplot(fig)
+                classes = np.unique(y_test)
+                cm = confusion_matrix(y_test, y_pred_best, labels=classes)
+                if plotly_installed:
+                    fig_cm = px.imshow(cm, x=[str(c) for c in classes], y=[str(c) for c in classes], color_continuous_scale='Blues', text_auto=True)
+                    fig_cm.update_layout(title=f'Confusion Matrix ({best_model_name})', xaxis_title='Predicted', yaxis_title='Actual', height=min(600, 200 + len(data)//10))
+                    st.plotly_chart(fig_cm, use_container_width=True)
+                else:
+                    fig, ax = plt.subplots()
+                    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax)
+                    ax.set_xlabel("Predicted")
+                    ax.set_ylabel("Actual")
+                    st.pyplot(fig)
 
                 # ROC Curve
                 try:
@@ -275,14 +290,21 @@ if uploaded_file:
                     y_pred_prob_best = best_model.predict_proba(X_test)[:,1] if hasattr(best_model, "predict_proba") else y_pred_best
                     fpr, tpr, _ = roc_curve(y_test, y_pred_prob_best)
                     roc_auc = roc_auc_score(y_test, y_pred_prob_best)
-                    fig2, ax2 = plt.subplots()
-                    ax2.plot(fpr, tpr, label=f'AUC = {roc_auc:.4f}')
-                    ax2.plot([0,1],[0,1],'--', color='gray')
-                    ax2.set_xlabel("False Positive Rate")
-                    ax2.set_ylabel("True Positive Rate")
-                    ax2.set_title("ROC Curve")
-                    ax2.legend()
-                    st.pyplot(fig2)
+                    if plotly_installed:
+                        fig_roc = go.Figure()
+                        fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode='lines', name=f'AUC = {roc_auc:.4f}'))
+                        fig_roc.add_trace(go.Scatter(x=[0,1], y=[0,1], mode='lines', line=dict(dash='dash'), showlegend=False))
+                        fig_roc.update_layout(title=f'ROC Curve ({best_model_name})', xaxis_title='False Positive Rate', yaxis_title='True Positive Rate', height=min(500, 200 + len(data)//10))
+                        st.plotly_chart(fig_roc, use_container_width=True)
+                    else:
+                        fig2, ax2 = plt.subplots()
+                        ax2.plot(fpr, tpr, label=f'AUC = {roc_auc:.4f}')
+                        ax2.plot([0,1],[0,1],'--', color='gray')
+                        ax2.set_xlabel("False Positive Rate")
+                        ax2.set_ylabel("True Positive Rate")
+                        ax2.set_title("ROC Curve")
+                        ax2.legend()
+                        st.pyplot(fig2)
                 except Exception:
                     st.info('ROC curve could not be computed for this model.')
 
@@ -293,9 +315,14 @@ if uploaded_file:
                     importance = best_model.feature_importances_
                     feature_imp = pd.DataFrame({'Feature': features, 'Importance': importance})
                     feature_imp = feature_imp.sort_values(by='Importance', ascending=False)
-                    fig3, ax3 = plt.subplots(figsize=(10,6))
-                    sns.barplot(x='Importance', y='Feature', data=feature_imp, ax=ax3)
-                    st.pyplot(fig3)
+                    if plotly_installed:
+                        fig3 = px.bar(feature_imp, x='Importance', y='Feature', orientation='h', title=f'Feature importance ({best_model_name})')
+                        fig3.update_layout(height=min(600, 100 + len(feature_imp)*30))
+                        st.plotly_chart(fig3, use_container_width=True)
+                    else:
+                        fig3, ax3 = plt.subplots(figsize=(10,6))
+                        sns.barplot(x='Importance', y='Feature', data=feature_imp, ax=ax3)
+                        st.pyplot(fig3)
 
                 # Download trained model
                 st.markdown('---')
