@@ -51,6 +51,21 @@ st.set_page_config(page_title="User Churn Prediction", layout="wide")
 st.title("🛡️ User Churn Prediction App (Advanced EDA + Models)")
 
 
+def safe_f1(y_true, y_pred):
+    """Compute F1 robustly. Falls back to macro/weighted average and zero_division handling when binary fails."""
+    try:
+        # try binary with safe zero_division
+        return f1_score(y_true, y_pred, zero_division=0)
+    except Exception:
+        try:
+            return f1_score(y_true, y_pred, average='macro', zero_division=0)
+        except Exception:
+            try:
+                return f1_score(y_true, y_pred, average='weighted', zero_division=0)
+            except Exception:
+                return 0.0
+
+
 def generate_business_insights(data: pd.DataFrame, target_col: str, best_model=None, features_list=None, contract_col_override=None, monthly_col_override=None):
     """Generate plain-language business insights based on data and model feature importances.
     Returns a dict with messages and recommended actions."""
@@ -361,7 +376,7 @@ if uploaded_file:
                 y_pred = model.predict(X_test)
                 y_pred_prob = model.predict_proba(X_test)[:,1] if hasattr(model, "predict_proba") else y_pred
                 acc = accuracy_score(y_test, y_pred)
-                f1 = f1_score(y_test, y_pred)
+                f1 = safe_f1(y_test, y_pred)
                 try:
                     roc = roc_auc_score(y_test, y_pred_prob)
                 except Exception:
@@ -427,7 +442,7 @@ if uploaded_file:
                 # show derived metrics at chosen threshold
                 try:
                     acc_t = accuracy_score(y_test, y_pred_best)
-                    f1_t = f1_score(y_test, y_pred_best)
+                    f1_t = safe_f1(y_test, y_pred_best)
                     st.write(f"Accuracy: {acc_t:.4f} — F1-score: {f1_t:.4f}")
                 except Exception:
                     pass
@@ -647,7 +662,7 @@ if uploaded_file:
                     y_pred = loaded_model.predict(X_test if 'X_test' in locals() else X_scaled)
                     y_pred_prob = loaded_model.predict_proba(X_test if 'X_test' in locals() else X_scaled)[:,1] if hasattr(loaded_model, 'predict_proba') else y_pred
                     acc = accuracy_score(y_test, y_pred) if 'y_test' in locals() else accuracy_score(y, y_pred)
-                    f1 = f1_score(y_test, y_pred) if 'y_test' in locals() else f1_score(y, y_pred)
+                    f1 = safe_f1(y_test, y_pred) if 'y_test' in locals() else safe_f1(y, y_pred)
                     try:
                         roc = roc_auc_score(y_test, y_pred_prob) if 'y_test' in locals() else roc_auc_score(y, y_pred_prob)
                     except Exception:
