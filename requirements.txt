@@ -8,3 +8,4 @@ plotly
 xgboost
 lightgbm
 catboost
+shap

@@ -27,6 +27,13 @@ try:
 except Exception:
     plotly_installed = False
 
+# Optional SHAP for explainability
+try:
+    import shap
+    shap_installed = True
+except Exception:
+    shap_installed = False
+
 # Optional: install LightGBM and CatBoost if you want
 try:
     import lightgbm as lgb
@@ -44,7 +51,7 @@ st.set_page_config(page_title="User Churn Prediction", layout="wide")
 st.title("🛡️ User Churn Prediction App (Advanced EDA + Models)")
 
 
-def generate_business_insights(data: pd.DataFrame, target_col: str, best_model=None, features_list=None):
+def generate_business_insights(data: pd.DataFrame, target_col: str, best_model=None, features_list=None, contract_col_override=None, monthly_col_override=None):
     """Generate plain-language business insights based on data and model feature importances.
     Returns a dict with messages and recommended actions."""
     insights = {}
@@ -69,12 +76,13 @@ def generate_business_insights(data: pd.DataFrame, target_col: str, best_model=N
     except Exception:
         churn_mask = pd.Series(False, index=y_raw.index)
 
-    # Contract churn comparison
-    contract_col = None
-    for cand in ['Contract', 'contract', 'CONTRACT', 'ContractType']:
-        if cand in data.columns:
-            contract_col = cand
-            break
+    # Contract churn comparison (allow override)
+    contract_col = contract_col_override if (contract_col_override in data.columns if contract_col_override is not None else False) else None
+    if contract_col is None:
+        for cand in ['Contract', 'contract', 'CONTRACT', 'ContractType']:
+            if cand in data.columns:
+                contract_col = cand
+                break
     if contract_col is not None:
         grp = data.groupby(contract_col)[target_col].apply(lambda s: ((s.astype(str).str.lower().isin(['yes','y','true']) if s.dtype == object else (s==1)) if True else s))
         # compute rates using churn_mask
@@ -98,12 +106,13 @@ def generate_business_insights(data: pd.DataFrame, target_col: str, best_model=N
     else:
         insights['contract'] = 'Contract-type column not found; cannot compute contract-based churn insight.'
 
-    # Monthly charges effect
-    monthly_col = None
-    for cand in ['MonthlyCharges', 'Monthly Charge', 'Monthly', 'monthlycharges']:
-        if cand in data.columns:
-            monthly_col = cand
-            break
+    # Monthly charges effect (allow override)
+    monthly_col = monthly_col_override if (monthly_col_override in data.columns if monthly_col_override is not None else False) else None
+    if monthly_col is None:
+        for cand in ['MonthlyCharges', 'Monthly Charge', 'Monthly', 'monthlycharges']:
+            if cand in data.columns:
+                monthly_col = cand
+                break
     if monthly_col is not None:
         try:
             mean_churn = data.loc[churn_mask, monthly_col].astype(float).mean()
@@ -157,6 +166,12 @@ if uploaded_file:
         st.subheader("Dataset Preview")
         st.write(f"Dataset size: {len(data):,} rows × {data.shape[1]} columns")
         st.dataframe(data.head())
+        # Let user pick which columns represent contract / monthly charges
+        st.markdown('---')
+        st.subheader('Column mapping for business insights')
+        col_options = [None] + list(data.columns)
+        contract_col_sel = st.selectbox('Select contract column (for business insight)', col_options, index=0)
+        monthly_col_sel = st.selectbox('Select monthly charge column (for business insight)', col_options, index=0)
         st.markdown("**Dataset Info**")
         buffer = io.StringIO()
         data.info(buf=buffer)
@@ -459,7 +474,7 @@ if uploaded_file:
 
                 # Business insights for business users
                 try:
-                    insights = generate_business_insights(data, target_column, best_model=best_model, features_list=features)
+                    insights = generate_business_insights(data, target_column, best_model=best_model, features_list=features, contract_col_override=contract_col_sel, monthly_col_override=monthly_col_sel)
                     st.markdown('---')
                     st.header('Business insights & suggested actions')
                     st.write(insights.get('contract'))
@@ -470,6 +485,27 @@ if uploaded_file:
                         st.write('- ' + a)
                 except Exception as e:
                     st.info('Could not generate business insights: ' + str(e))
+
+                # Export insights as text file
+                try:
+                    insights_txt = '\n'.join([insights.get('contract',''), insights.get('monthly',''), insights.get('top_features',''), '\nRecommended actions:'] + insights.get('actions', []))
+                    st.download_button('Export insights (txt)', insights_txt, file_name='business_insights.txt')
+                except Exception:
+                    pass
+
+                # SHAP explainability for tree models
+                if shap_installed and best_model_name in ['Decision Tree', 'Random Forest', 'XGBoost', 'LightGBM', 'CatBoost']:
+                    st.markdown('---')
+                    st.subheader('SHAP explanations (global)')
+                    try:
+                        # compute shap values for a subset
+                        explainer = shap.TreeExplainer(best_model)
+                        sample = pd.DataFrame(X_test).astype(float)
+                        sample_small = sample.sample(n=min(200, sample.shape[0]), random_state=42)
+                        shap_values = explainer.shap_values(sample_small)
+                        st.pyplot(shap.summary_plot(shap_values, sample_small, show=False))
+                    except Exception as e:
+                        st.info('Could not compute SHAP explanations: ' + str(e))
 
                 # Download trained model
                 st.markdown('---')
