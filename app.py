@@ -66,6 +66,41 @@ def safe_f1(y_true, y_pred):
                 return 0.0
 
 
+        def safe_roc_auc(y_true, y_score):
+            """Compute ROC AUC safely for binary and multiclass when possible.
+            Returns np.nan when ROC-AUC is not applicable or fails.
+            - For binary targets expects a 1d score (probabilities) or a 2D proba matrix (takes column 1).
+            - For multiclass expects a 2D probability matrix shaped (n_samples, n_classes).
+            """
+            try:
+                y_true_arr = np.array(y_true)
+                y_score_arr = np.array(y_score)
+                # remove NaNs in y_true
+                mask = ~pd.isnull(y_true_arr)
+                y_true_arr = y_true_arr[mask]
+                y_score_arr = y_score_arr[mask]
+                uniq = np.unique(y_true_arr)
+                if len(uniq) <= 1:
+                    return np.nan
+                # binary
+                if len(uniq) == 2:
+                    # if score is 2D, try to take the positive class column
+                    if y_score_arr.ndim == 1:
+                        return roc_auc_score(y_true_arr, y_score_arr)
+                    elif y_score_arr.ndim == 2 and y_score_arr.shape[1] >= 2:
+                        return roc_auc_score(y_true_arr, y_score_arr[:, 1])
+                    else:
+                        return np.nan
+                # multiclass
+                if len(uniq) > 2:
+                    if y_score_arr.ndim == 2 and y_score_arr.shape[1] == len(uniq):
+                        return roc_auc_score(y_true_arr, y_score_arr, multi_class='ovr', average='macro')
+                    else:
+                        return np.nan
+            except Exception:
+                return np.nan
+
+
 def generate_business_insights(data: pd.DataFrame, target_col: str, best_model=None, features_list=None, contract_col_override=None, monthly_col_override=None):
     """Generate plain-language business insights based on data and model feature importances.
     Returns a dict with messages and recommended actions."""
@@ -299,7 +334,23 @@ if uploaded_file:
         X = data[features].copy()
         y = data[target_column].copy()
 
-        # --- Preprocessing options ---
+        # Check target distribution and warn if many unique values (possible regression label)
+        allow_modeling = True
+        try:
+            unique_vals = y.dropna().unique()
+            n_unique = len(unique_vals)
+            n_samples = len(y.dropna())
+            suspicious = False
+            # heuristics: if unique classes > 10 or unique classes > 50% of samples -> suspicious
+            if n_unique > 10 or (n_samples > 0 and (n_unique / n_samples) > 0.5):
+                suspicious = True
+            if suspicious:
+                st.warning(f"Target column appears to have {n_unique} unique values across {n_samples} non-null samples. This may be a regression target rather than classification. Many classification metrics (ROC-AUC, confusion matrix) may be misleading.")
+                allow_modeling = st.checkbox('I understand and want to proceed with classification metrics on this target (only proceed if intended)', value=False)
+        except Exception:
+            allow_modeling = True
+
+    # --- Preprocessing options ---
         st.markdown('#### Preprocessing options')
         impute_method = st.selectbox('Missing value imputation', ['None', 'Mean', 'Median', 'Most frequent'], index=0)
         encoding_method = st.selectbox('Categorical encoding', ['LabelEncoder', 'OneHot'], index=0)
@@ -349,7 +400,11 @@ if uploaded_file:
 
         # Step 5: Model source selection: train locally or upload pretrained
         st.markdown('### Model source')
-        model_mode = st.radio('Choose how you want to get a model', ['Train locally', 'Upload pretrained model'], index=0)
+        if not allow_modeling:
+            st.info('Modeling disabled due to suspicious target distribution. Check the confirmation box above to proceed with modeling.')
+            model_mode = None
+        else:
+            model_mode = st.radio('Choose how you want to get a model', ['Train locally', 'Upload pretrained model'], index=0)
 
         results = []
         model_objects = {}
@@ -360,7 +415,8 @@ if uploaded_file:
                 "Logistic Regression": LogisticRegression(max_iter=1000),
                 "Decision Tree": DecisionTreeClassifier(),
                 "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
-                "XGBoost": xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+                # removed deprecated use_label_encoder param to avoid warnings
+                "XGBoost": xgb.XGBClassifier(eval_metric='logloss', random_state=42)
             }
 
             if lightgbm_installed:
@@ -377,10 +433,8 @@ if uploaded_file:
                 y_pred_prob = model.predict_proba(X_test)[:,1] if hasattr(model, "predict_proba") else y_pred
                 acc = accuracy_score(y_test, y_pred)
                 f1 = safe_f1(y_test, y_pred)
-                try:
-                    roc = roc_auc_score(y_test, y_pred_prob)
-                except Exception:
-                    roc = np.nan
+                # compute ROC-AUC safely
+                roc = safe_roc_auc(y_test, y_pred_prob)
                 results.append([name, acc, f1, roc])
                 model_objects[name] = model
 
@@ -401,9 +455,17 @@ if uploaded_file:
                     for name, mdl in model_objects.items():
                         try:
                             if hasattr(mdl, 'predict_proba'):
-                                probs = mdl.predict_proba(X_test)[:,1]
+                                probs_all = mdl.predict_proba(X_test)
+                                # attempt safe AUC
+                                auc_m = safe_roc_auc(y_test, probs_all)
+                                if np.isnan(auc_m):
+                                    continue
+                                # for binary, take positive column for curve
+                                if probs_all.ndim == 1 or (probs_all.ndim == 2 and probs_all.shape[1] == 1):
+                                    probs = probs_all
+                                else:
+                                    probs = probs_all[:, 1]
                                 fpr_m, tpr_m, _ = roc_curve(y_test, probs)
-                                auc_m = roc_auc_score(y_test, probs)
                                 fig_multi.add_trace(go.Scatter(x=fpr_m, y=tpr_m, mode='lines', name=f"{name} (AUC {auc_m:.3f})"))
                         except Exception:
                             # skip models without probability or failing
@@ -450,24 +512,38 @@ if uploaded_file:
                 # ROC Curve
                 try:
                     st.subheader(f"ROC Curve ({best_model_name})")
-                    y_pred_prob_best = best_model.predict_proba(X_test)[:,1] if hasattr(best_model, "predict_proba") else y_pred_best
-                    fpr, tpr, _ = roc_curve(y_test, y_pred_prob_best)
-                    roc_auc = roc_auc_score(y_test, y_pred_prob_best)
-                    if plotly_installed:
-                        fig_roc = go.Figure()
-                        fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode='lines', name=f'AUC = {roc_auc:.4f}'))
-                        fig_roc.add_trace(go.Scatter(x=[0,1], y=[0,1], mode='lines', line=dict(dash='dash'), showlegend=False))
-                        fig_roc.update_layout(title=f'ROC Curve ({best_model_name})', xaxis_title='False Positive Rate', yaxis_title='True Positive Rate', height=min(500, 200 + len(data)//10))
-                        st.plotly_chart(fig_roc, use_container_width=True)
+                    if hasattr(best_model, "predict_proba"):
+                        probs_all_best = best_model.predict_proba(X_test)
                     else:
-                        fig2, ax2 = plt.subplots()
-                        ax2.plot(fpr, tpr, label=f'AUC = {roc_auc:.4f}')
-                        ax2.plot([0,1],[0,1],'--', color='gray')
-                        ax2.set_xlabel("False Positive Rate")
-                        ax2.set_ylabel("True Positive Rate")
-                        ax2.set_title("ROC Curve")
-                        ax2.legend()
-                        st.pyplot(fig2)
+                        probs_all_best = None
+                    auc_val = safe_roc_auc(y_test, probs_all_best if probs_all_best is not None else y_pred_best)
+                    if np.isnan(auc_val):
+                        st.info('ROC-AUC not applicable for this target/problem (maybe multiclass without proper probability matrix or single-class).')
+                    else:
+                        # get binary score for curve plotting
+                        if probs_all_best is not None and probs_all_best.ndim == 2 and probs_all_best.shape[1] >= 2:
+                            scores_for_curve = probs_all_best[:, 1]
+                        elif probs_all_best is not None and probs_all_best.ndim == 1:
+                            scores_for_curve = probs_all_best
+                        else:
+                            scores_for_curve = y_pred_best
+                        fpr, tpr, _ = roc_curve(y_test, scores_for_curve)
+                        roc_auc = auc_val
+                        if plotly_installed:
+                            fig_roc = go.Figure()
+                            fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode='lines', name=f'AUC = {roc_auc:.4f}'))
+                            fig_roc.add_trace(go.Scatter(x=[0,1], y=[0,1], mode='lines', line=dict(dash='dash'), showlegend=False))
+                            fig_roc.update_layout(title=f'ROC Curve ({best_model_name})', xaxis_title='False Positive Rate', yaxis_title='True Positive Rate', height=min(500, 200 + len(data)//10))
+                            st.plotly_chart(fig_roc, use_container_width=True)
+                        else:
+                            fig2, ax2 = plt.subplots()
+                            ax2.plot(fpr, tpr, label=f'AUC = {roc_auc:.4f}')
+                            ax2.plot([0,1],[0,1],'--', color='gray')
+                            ax2.set_xlabel("False Positive Rate")
+                            ax2.set_ylabel("True Positive Rate")
+                            ax2.set_title("ROC Curve")
+                            ax2.legend()
+                            st.pyplot(fig2)
                 except Exception:
                     st.info('ROC curve could not be computed for this model.')
 
@@ -661,40 +737,44 @@ if uploaded_file:
                 try:
                     y_pred = loaded_model.predict(X_test if 'X_test' in locals() else X_scaled)
                     y_pred_prob = loaded_model.predict_proba(X_test if 'X_test' in locals() else X_scaled)[:,1] if hasattr(loaded_model, 'predict_proba') else y_pred
-                    acc = accuracy_score(y_test, y_pred) if 'y_test' in locals() else accuracy_score(y, y_pred)
-                    f1 = safe_f1(y_test, y_pred) if 'y_test' in locals() else safe_f1(y, y_pred)
-                    try:
-                        roc = roc_auc_score(y_test, y_pred_prob) if 'y_test' in locals() else roc_auc_score(y, y_pred_prob)
-                    except Exception:
-                        roc = np.nan
-                    st.subheader('Uploaded model evaluation')
-                    st.dataframe(pd.DataFrame([[ 'Uploaded model', acc, f1, roc]], columns=["Model","Accuracy","F1-score","ROC-AUC"]))
+                    if allow_modeling:
+                        acc = accuracy_score(y_test, y_pred) if 'y_test' in locals() else accuracy_score(y, y_pred)
+                        f1 = safe_f1(y_test, y_pred) if 'y_test' in locals() else safe_f1(y, y_pred)
+                        roc = safe_roc_auc(y_test, y_pred_prob) if 'y_test' in locals() else safe_roc_auc(y, y_pred_prob)
+                        st.subheader('Uploaded model evaluation')
+                        st.dataframe(pd.DataFrame([[ 'Uploaded model', acc, f1, roc]], columns=["Model","Accuracy","F1-score","ROC-AUC"]))
 
-                    # Confusion matrix
-                    st.subheader('Confusion Matrix (Uploaded model)')
-                    cm = confusion_matrix(y_test, y_pred) if 'y_test' in locals() else confusion_matrix(y, y_pred)
-                    fig, ax = plt.subplots()
-                    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax)
-                    ax.set_xlabel('Predicted')
-                    ax.set_ylabel('Actual')
-                    st.pyplot(fig)
+                        # Confusion matrix
+                        st.subheader('Confusion Matrix (Uploaded model)')
+                        cm = confusion_matrix(y_test, y_pred) if 'y_test' in locals() else confusion_matrix(y, y_pred)
+                        fig, ax = plt.subplots()
+                        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax)
+                        ax.set_xlabel('Predicted')
+                        ax.set_ylabel('Actual')
+                        st.pyplot(fig)
 
-                    # ROC
-                    if hasattr(loaded_model, 'predict_proba'):
-                        try:
-                            st.subheader('ROC Curve (Uploaded model)')
-                            fpr, tpr, _ = roc_curve(y_test if 'y_test' in locals() else y, y_pred_prob)
-                            roc_auc = roc_auc_score(y_test if 'y_test' in locals() else y, y_pred_prob)
-                            fig2, ax2 = plt.subplots()
-                            ax2.plot(fpr, tpr, label=f'AUC = {roc_auc:.4f}')
-                            ax2.plot([0,1],[0,1],'--', color='gray')
-                            ax2.set_xlabel('False Positive Rate')
-                            ax2.set_ylabel('True Positive Rate')
-                            ax2.set_title('ROC Curve')
-                            ax2.legend()
-                            st.pyplot(fig2)
-                        except Exception:
-                            st.info('ROC curve could not be computed for uploaded model.')
+                        # ROC
+                        if hasattr(loaded_model, 'predict_proba'):
+                            try:
+                                st.subheader('ROC Curve (Uploaded model)')
+                                auc_val = safe_roc_auc(y_test if 'y_test' in locals() else y, y_pred_prob)
+                                if np.isnan(auc_val):
+                                    st.info('ROC-AUC not applicable for this target/problem (maybe multiclass without proper probability matrix or single-class).')
+                                else:
+                                    fpr, tpr, _ = roc_curve(y_test if 'y_test' in locals() else y, y_pred_prob)
+                                    roc_auc = auc_val
+                                    fig2, ax2 = plt.subplots()
+                                    ax2.plot(fpr, tpr, label=f'AUC = {roc_auc:.4f}')
+                                    ax2.plot([0,1],[0,1],'--', color='gray')
+                                    ax2.set_xlabel('False Positive Rate')
+                                    ax2.set_ylabel('True Positive Rate')
+                                    ax2.set_title('ROC Curve')
+                                    ax2.legend()
+                                    st.pyplot(fig2)
+                            except Exception:
+                                st.info('ROC curve could not be computed for uploaded model.')
+                    else:
+                        st.info('Target appears to be continuous or has many unique values; skipping classification metrics to avoid misleading results. If you want to force evaluation as classification, confirm above.')
                     try:
                         insights = generate_business_insights(data, target_column, best_model=loaded_model, features_list=features)
                         st.markdown('---')
