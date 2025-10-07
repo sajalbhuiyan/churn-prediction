@@ -43,6 +43,106 @@ except:
 st.set_page_config(page_title="User Churn Prediction", layout="wide")
 st.title("🛡️ User Churn Prediction App (Advanced EDA + Models)")
 
+
+def generate_business_insights(data: pd.DataFrame, target_col: str, best_model=None, features_list=None):
+    """Generate plain-language business insights based on data and model feature importances.
+    Returns a dict with messages and recommended actions."""
+    insights = {}
+    y_raw = data[target_col]
+
+    # infer churn mask
+    try:
+        if pd.api.types.is_numeric_dtype(y_raw):
+            uniq = sorted(y_raw.dropna().unique())
+            if set(uniq) <= {0, 1}:
+                churn_mask = (y_raw == 1)
+            else:
+                # fallback: less frequent value considered churn
+                churn_mask = (y_raw != y_raw.mode()[0])
+        else:
+            low = y_raw.astype(str).str.lower()
+            if (low == 'yes').any() or (low == 'y').any() or (low == 'true').any():
+                churn_mask = low.isin(['yes', 'y', 'true'])
+            else:
+                # assume minority class is churn
+                churn_mask = (y_raw != y_raw.mode()[0])
+    except Exception:
+        churn_mask = pd.Series(False, index=y_raw.index)
+
+    # Contract churn comparison
+    contract_col = None
+    for cand in ['Contract', 'contract', 'CONTRACT', 'ContractType']:
+        if cand in data.columns:
+            contract_col = cand
+            break
+    if contract_col is not None:
+        grp = data.groupby(contract_col)[target_col].apply(lambda s: ((s.astype(str).str.lower().isin(['yes','y','true']) if s.dtype == object else (s==1)) if True else s))
+        # compute rates using churn_mask
+        rates = data.groupby(contract_col).apply(lambda df: churn_mask.loc[df.index].mean())
+        # try to find month-to-month vs yearly
+        month_rate = None
+        yearly_rate = None
+        for k in rates.index:
+            if 'month' in str(k).lower():
+                month_rate = rates[k]
+        yearly_vals = [k for k in rates.index if ('year' in str(k).lower() or 'one' in str(k).lower() or 'two' in str(k).lower())]
+        if yearly_vals:
+            yearly_rate = rates.loc[yearly_vals].mean()
+        if month_rate is not None and yearly_rate is not None and yearly_rate > 0:
+            multiplier = month_rate / yearly_rate
+            insights['contract'] = f"Customers on month-to-month contracts churn {multiplier:.2f}× more than yearly contracts (month-to-month: {month_rate:.1%}, yearly avg: {yearly_rate:.1%})."
+        else:
+            # show top and bottom
+            sr = rates.sort_values(ascending=False)
+            insights['contract'] = f"Churn rates by {contract_col}: " + ', '.join([f"{idx}: {val:.1%}" for idx,val in sr.items()])
+    else:
+        insights['contract'] = 'Contract-type column not found; cannot compute contract-based churn insight.'
+
+    # Monthly charges effect
+    monthly_col = None
+    for cand in ['MonthlyCharges', 'Monthly Charge', 'Monthly', 'monthlycharges']:
+        if cand in data.columns:
+            monthly_col = cand
+            break
+    if monthly_col is not None:
+        try:
+            mean_churn = data.loc[churn_mask, monthly_col].astype(float).mean()
+            mean_keep = data.loc[~churn_mask, monthly_col].astype(float).mean()
+            if pd.notna(mean_churn) and pd.notna(mean_keep) and mean_keep > 0:
+                pct = (mean_churn - mean_keep) / mean_keep * 100
+                insights['monthly'] = f"High monthly charges increase churn probability: churners pay on average ${mean_churn:,.2f} vs ${mean_keep:,.2f} for non-churners ({pct:.0f}% higher)."
+            else:
+                insights['monthly'] = 'Could not compute monthly charge comparison (missing or non-numeric).'
+        except Exception:
+            insights['monthly'] = 'Could not compute monthly charge comparison (error).'
+    else:
+        insights['monthly'] = 'Monthly charge column not found.'
+
+    # Top features from model
+    if best_model is not None and features_list is not None:
+        try:
+            if hasattr(best_model, 'feature_importances_'):
+                imp = best_model.feature_importances_
+                fi = pd.DataFrame({'feature': features_list, 'importance': imp}).sort_values('importance', ascending=False)
+                top = fi.head(5)
+                insights['top_features'] = 'Top features linked to churn: ' + ', '.join([f"{r['feature']}" for _, r in top.iterrows()])
+            else:
+                insights['top_features'] = 'Model does not expose feature_importances_; consider using permutation importance or SHAP for more insights.'
+        except Exception:
+            insights['top_features'] = 'Could not compute feature importance.'
+    else:
+        insights['top_features'] = 'No model feature importances available.'
+
+    # Actionable steps
+    actions = []
+    actions.append('Target high-risk customers (identified by the model) with retention offers and personalized incentives, especially month-to-month customers.')
+    actions.append('Consider pricing review or discounts for customers with high monthly charges; offer multi-month discounts or bundled services to reduce churn.')
+    actions.append('Investigate the top features above for product or service improvements (e.g., reduce complaint types, simplify billing, improve service reliability).')
+    insights['actions'] = actions
+
+    # Return insights
+    return insights
+
 # Step 1: Upload CSV
 uploaded_file = st.file_uploader("Upload your CSV file", type=["csv"]) 
 
@@ -263,14 +363,39 @@ if uploaded_file:
                 st.plotly_chart(fig_cmp, use_container_width=True)
             st.dataframe(results_df)
 
+            # Multi-model ROC overlay
+            if plotly_installed and model_objects:
+                show_multi_roc = st.checkbox('Show multi-model ROC overlay', value=False)
+                if show_multi_roc:
+                    fig_multi = go.Figure()
+                    for name, mdl in model_objects.items():
+                        try:
+                            if hasattr(mdl, 'predict_proba'):
+                                probs = mdl.predict_proba(X_test)[:,1]
+                                fpr_m, tpr_m, _ = roc_curve(y_test, probs)
+                                auc_m = roc_auc_score(y_test, probs)
+                                fig_multi.add_trace(go.Scatter(x=fpr_m, y=tpr_m, mode='lines', name=f"{name} (AUC {auc_m:.3f})"))
+                        except Exception:
+                            # skip models without probability or failing
+                            continue
+                    fig_multi.add_trace(go.Scatter(x=[0,1], y=[0,1], mode='lines', line=dict(dash='dash'), showlegend=False))
+                    fig_multi.update_layout(title='Multi-model ROC overlay', xaxis_title='False Positive Rate', yaxis_title='True Positive Rate', height=500)
+                    st.plotly_chart(fig_multi, use_container_width=True)
+
             if not results_df.empty:
                 best_model_name = results_df.iloc[0]["Model"]
                 st.success(f"Best Model (by ROC-AUC): {best_model_name}")
                 best_model = model_objects[best_model_name]
 
-                # Confusion Matrix
-                st.subheader(f"Confusion Matrix ({best_model_name})")
-                y_pred_best = best_model.predict(X_test)
+                # Interactive threshold and Confusion Matrix
+                st.subheader(f"Confusion Matrix & Threshold ({best_model_name})")
+                # If model supports predict_proba, let user pick a threshold
+                if hasattr(best_model, 'predict_proba'):
+                    y_pred_prob_best = best_model.predict_proba(X_test)[:,1]
+                    threshold = st.slider('Prediction threshold', 0.0, 1.0, 0.5, step=0.01)
+                    y_pred_best = (y_pred_prob_best >= threshold).astype(int)
+                else:
+                    y_pred_best = best_model.predict(X_test)
                 classes = np.unique(y_test)
                 cm = confusion_matrix(y_test, y_pred_best, labels=classes)
                 if plotly_installed:
@@ -283,6 +408,14 @@ if uploaded_file:
                     ax.set_xlabel("Predicted")
                     ax.set_ylabel("Actual")
                     st.pyplot(fig)
+
+                # show derived metrics at chosen threshold
+                try:
+                    acc_t = accuracy_score(y_test, y_pred_best)
+                    f1_t = f1_score(y_test, y_pred_best)
+                    st.write(f"Accuracy: {acc_t:.4f} — F1-score: {f1_t:.4f}")
+                except Exception:
+                    pass
 
                 # ROC Curve
                 try:
@@ -323,6 +456,20 @@ if uploaded_file:
                         fig3, ax3 = plt.subplots(figsize=(10,6))
                         sns.barplot(x='Importance', y='Feature', data=feature_imp, ax=ax3)
                         st.pyplot(fig3)
+
+                # Business insights for business users
+                try:
+                    insights = generate_business_insights(data, target_column, best_model=best_model, features_list=features)
+                    st.markdown('---')
+                    st.header('Business insights & suggested actions')
+                    st.write(insights.get('contract'))
+                    st.write(insights.get('monthly'))
+                    st.write(insights.get('top_features'))
+                    st.subheader('Recommended actions')
+                    for a in insights.get('actions', []):
+                        st.write('- ' + a)
+                except Exception as e:
+                    st.info('Could not generate business insights: ' + str(e))
 
                 # Download trained model
                 st.markdown('---')
@@ -497,6 +644,18 @@ if uploaded_file:
                             st.pyplot(fig2)
                         except Exception:
                             st.info('ROC curve could not be computed for uploaded model.')
+                    try:
+                        insights = generate_business_insights(data, target_column, best_model=loaded_model, features_list=features)
+                        st.markdown('---')
+                        st.header('Business insights & suggested actions (uploaded model)')
+                        st.write(insights.get('contract'))
+                        st.write(insights.get('monthly'))
+                        st.write(insights.get('top_features'))
+                        st.subheader('Recommended actions')
+                        for a in insights.get('actions', []):
+                            st.write('- ' + a)
+                    except Exception as e:
+                        st.info('Could not generate business insights for uploaded model: ' + str(e))
                 except Exception as e:
                     st.error(f'Failed to run predictions with the uploaded model: {e}')
 
