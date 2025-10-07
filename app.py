@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import io
 import pickle
+from sklearn.impute import SimpleImputer
+from sklearn.utils import resample
 try:
     import joblib
     joblib_installed = True
@@ -55,9 +57,9 @@ if uploaded_file:
         st.subheader("Dataset Preview")
         st.dataframe(data.head())
         st.markdown("**Dataset Info**")
-        buffer = []
+        buffer = io.StringIO()
         data.info(buf=buffer)
-        st.text('\n'.join(buffer))
+        st.text(buffer.getvalue())
         st.write("Missing values per column:")
         st.dataframe(data.isnull().sum().rename('missing_count'))
 
@@ -163,19 +165,49 @@ if uploaded_file:
         X = data[features].copy()
         y = data[target_column].copy()
 
-        # Encode categorical features
-        for col in X.select_dtypes(include=['object', 'category']).columns:
-            le = LabelEncoder()
-            X[col] = le.fit_transform(X[col].astype(str))
+        # --- Preprocessing options ---
+        st.markdown('#### Preprocessing options')
+        impute_method = st.selectbox('Missing value imputation', ['None', 'Mean', 'Median', 'Most frequent'], index=0)
+        encoding_method = st.selectbox('Categorical encoding', ['LabelEncoder', 'OneHot'], index=0)
+        scaling_method = st.selectbox('Scaling', ['Standard', 'None'], index=0)
+        class_balance = st.selectbox('Class balancing (after split)', ['None', 'Upsample minority', 'Downsample majority'], index=0)
 
         # Encode target if categorical
         if y.dtype == 'object' or y.dtype.name == 'category':
             le_target = LabelEncoder()
             y = le_target.fit_transform(y.astype(str))
 
+        # Apply imputation if requested
+        X_proc = X.copy()
+        if impute_method != 'None':
+            strategy = 'mean' if impute_method == 'Mean' else ('median' if impute_method == 'Median' else 'most_frequent')
+            imputer = SimpleImputer(strategy=strategy)
+            # Only apply to numeric columns
+            num_cols = X_proc.select_dtypes(include=[np.number]).columns.tolist()
+            if num_cols:
+                X_proc[num_cols] = imputer.fit_transform(X_proc[num_cols])
+
+        # Encode categorical features
+        if encoding_method == 'LabelEncoder':
+            for col in X_proc.select_dtypes(include=['object', 'category']).columns:
+                le = LabelEncoder()
+                X_proc[col] = le.fit_transform(X_proc[col].astype(str))
+        else:
+            # One-hot encode and avoid creating too many columns
+            cat_cols = X_proc.select_dtypes(include=['object', 'category']).columns.tolist()
+            if cat_cols:
+                X_proc = pd.get_dummies(X_proc, columns=cat_cols, drop_first=True)
+
         # Optional: Scale features (we'll fit if training locally or use uploaded preprocessor)
         scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
+        if scaling_method == 'Standard':
+            try:
+                X_scaled = scaler.fit_transform(X_proc)
+            except Exception:
+                # fallback to original
+                X_scaled = scaler.fit_transform(X_proc.fillna(0))
+        else:
+            X_scaled = X_proc.values
 
         # Step 4: Train-test split
         test_size = st.slider("Select test size (percentage)", min_value=10, max_value=50, value=20, key='test_size')
@@ -264,6 +296,70 @@ if uploaded_file:
                     fig3, ax3 = plt.subplots(figsize=(10,6))
                     sns.barplot(x='Importance', y='Feature', data=feature_imp, ax=ax3)
                     st.pyplot(fig3)
+
+                # Download trained model
+                st.markdown('---')
+                st.markdown('**Download trained model**')
+                buf = io.BytesIO()
+                try:
+                    if joblib_installed:
+                        joblib.dump(best_model, buf)
+                        buf.seek(0)
+                        st.download_button('Download model (joblib)', buf, file_name='best_model.joblib')
+                    else:
+                        pickle.dump(best_model, buf)
+                        buf.seek(0)
+                        st.download_button('Download model (pickle)', buf, file_name='best_model.pkl')
+                except Exception as e:
+                    st.error(f'Could not prepare model for download: {e}')
+
+                # Single-row prediction UI
+                st.markdown('---')
+                st.subheader('Predict with the selected model (single row)')
+                with st.form('single_predict'):
+                    input_values = {}
+                    for col in X.columns:
+                        if pd.api.types.is_numeric_dtype(data[col]):
+                            v = st.number_input(f'{col}', value=float(data[col].dropna().median()) if not data[col].dropna().empty else 0.0)
+                        else:
+                            opts = list(data[col].dropna().unique())[:200]
+                            v = st.selectbox(f'{col}', options=opts)
+                        input_values[col] = v
+                    submitted = st.form_submit_button('Predict')
+                    if submitted:
+                        single_df = pd.DataFrame([input_values])
+                        # Apply same preprocessing steps
+                        single_proc = single_df.copy()
+                        if impute_method != 'None':
+                            # only numeric
+                            num_cols = single_proc.select_dtypes(include=[np.number]).columns.tolist()
+                            if num_cols:
+                                single_proc[num_cols] = imputer.transform(single_proc[num_cols])
+                        if encoding_method == 'LabelEncoder':
+                            for col in single_proc.select_dtypes(include=['object', 'category']).columns:
+                                le = LabelEncoder()
+                                # fit on original column values to align labels
+                                le.fit(data[col].astype(str))
+                                single_proc[col] = le.transform(single_proc[col].astype(str))
+                        else:
+                            if cat_cols:
+                                single_proc = pd.get_dummies(single_proc, columns=cat_cols, drop_first=True)
+                                # align columns with training
+                                for c in set(X_proc.columns) - set(single_proc.columns):
+                                    single_proc[c] = 0
+                                single_proc = single_proc[X_proc.columns]
+                        if scaling_method == 'Standard':
+                            single_scaled = scaler.transform(single_proc)
+                        else:
+                            single_scaled = single_proc.values
+                        try:
+                            pred = best_model.predict(single_scaled)
+                            prob = best_model.predict_proba(single_scaled)[:,1] if hasattr(best_model, 'predict_proba') else None
+                            st.write('Prediction:', pred[0])
+                            if prob is not None:
+                                st.write('Probability:', float(prob[0]))
+                        except Exception as e:
+                            st.error(f'Prediction failed: {e}')
 
         else:
             st.markdown('### Upload pretrained model')
