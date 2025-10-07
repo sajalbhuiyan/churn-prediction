@@ -50,6 +50,8 @@ except:
 st.set_page_config(page_title="User Churn Prediction", layout="wide")
 st.title("🛡️ User Churn Prediction App (Advanced EDA + Models)")
 
+# Deployment note: ensure safe_roc_auc is a top-level function (fix for NameError seen in some deployments)
+
 
 def safe_f1(y_true, y_pred):
     """Compute F1 robustly. Falls back to macro/weighted average and zero_division handling when binary fails."""
